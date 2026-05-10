@@ -4,6 +4,14 @@ name: "[Reusable] Go CI + Cloud Run Deploy"
 # Reusable workflow: Go vet/test → deploy to GCP Cloud Run
 # Called by each Go microservice with its own service_name
 # and env_vars.
+#
+# Secrets (tutti passati via `secrets: inherit` dal caller):
+#   GCP_WORKLOAD_IDENTITY_PROVIDER  — obbligatorio
+#   GCP_SERVICE_ACCOUNT_EMAIL       — obbligatorio (per auth WIF)
+#   GCP_RUNTIME_SERVICE_ACCOUNT     — opzionale: email SA runtime
+#                                     del servizio Cloud Run.
+#                                     Se assente, Cloud Run usa
+#                                     il SA di default del progetto.
 # ──────────────────────────────────────────────────────────────
 on:
   workflow_call:
@@ -23,15 +31,10 @@ on:
         type: string
         default: "europe-west8"
       ingress_flag:
-        description: "--ingress flag value (e.g. --ingress=internal-and-cloud-load-balancing)"
+        description: "--ingress flag (e.g. --ingress=internal-and-cloud-load-balancing)"
         required: false
         type: string
         default: "--ingress=internal-and-cloud-load-balancing"
-      service_account_flag:
-        description: "--service-account flag (e.g. --service-account=sa@project.iam.gserviceaccount.com)"
-        required: false
-        type: string
-        default: ""
       extra_flags:
         description: "Additional Cloud Run flags"
         required: false
@@ -47,6 +50,8 @@ on:
         required: true
       GCP_SERVICE_ACCOUNT_EMAIL:
         required: true
+      GCP_RUNTIME_SERVICE_ACCOUNT:
+        required: false   # email SA runtime del servizio (opzionale)
 
 env:
   GO_VERSION: ${{ inputs.go_version }}
@@ -100,9 +105,9 @@ jobs:
           service: ${{ inputs.service_name }}
           region: ${{ inputs.region }}
           source: .
-          flags: |
+          flags: >
             --port=8080
             ${{ inputs.ingress_flag }}
-            ${{ inputs.service_account_flag }}
+            ${{ secrets.GCP_RUNTIME_SERVICE_ACCOUNT != '' && format('--service-account={0}', secrets.GCP_RUNTIME_SERVICE_ACCOUNT) || '' }}
             ${{ inputs.extra_flags }}
           env_vars: ${{ inputs.env_vars }}
