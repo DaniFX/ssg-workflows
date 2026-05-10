@@ -2,16 +2,23 @@ name: "[Reusable] Go CI + Cloud Run Deploy"
 
 # ──────────────────────────────────────────────────────────────
 # Reusable workflow: Go vet/test → deploy to GCP Cloud Run
-# Called by each Go microservice with its own service_name
-# and env_vars.
 #
-# Secrets (tutti passati via `secrets: inherit` dal caller):
-#   GCP_WORKLOAD_IDENTITY_PROVIDER  — obbligatorio
-#   GCP_SERVICE_ACCOUNT_EMAIL       — obbligatorio (per auth WIF)
-#   GCP_RUNTIME_SERVICE_ACCOUNT     — opzionale: email SA runtime
-#                                     del servizio Cloud Run.
-#                                     Se assente, Cloud Run usa
-#                                     il SA di default del progetto.
+# DESIGN: env_vars per Cloud Run non possono essere passate come
+# input (GitHub non espande secrets negli inputs). Vengono quindi
+# iniettate direttamente tramite i secrets dichiarati qui sotto.
+# Ogni servizio imposta solo i secrets che gli servono; quelli
+# vuoti vengono ignorati automaticamente dallo step di deploy.
+#
+# Secrets obbligatori (tutti via `secrets: inherit`):
+#   GCP_WORKLOAD_IDENTITY_PROVIDER
+#   GCP_SERVICE_ACCOUNT_EMAIL
+#
+# Secrets opzionali — env vars Cloud Run:
+#   GCP_PROJECT_ID, GCP_RUNTIME_SERVICE_ACCOUNT,
+#   GATEWAY_URL, INTERNAL_SECRET, SERVICE_URL,
+#   DOCUMENT_SERVICE_URL, FIREBASE_PROJECT_ID,
+#   FIREBASE_WEB_API_KEY, ADMIN_EMAILS,
+#   FIREBASE_STORAGE_BUCKET
 # ──────────────────────────────────────────────────────────────
 on:
   workflow_call:
@@ -21,7 +28,7 @@ on:
         required: true
         type: string
       go_version:
-        description: "Go version to use"
+        description: "Go version"
         required: false
         type: string
         default: "1.22"
@@ -31,30 +38,43 @@ on:
         type: string
         default: "europe-west8"
       ingress_flag:
-        description: "--ingress flag (e.g. --ingress=internal-and-cloud-load-balancing)"
+        description: "--ingress flag value"
         required: false
         type: string
         default: "--ingress=internal-and-cloud-load-balancing"
       extra_flags:
-        description: "Additional Cloud Run flags"
-        required: false
-        type: string
-        default: ""
-      env_vars:
-        description: "Newline-separated env vars for Cloud Run (KEY=value)"
+        description: "Additional Cloud Run deploy flags"
         required: false
         type: string
         default: ""
     secrets:
+      # ── Auth (obbligatori) ───────────────────────────────────
       GCP_WORKLOAD_IDENTITY_PROVIDER:
         required: true
       GCP_SERVICE_ACCOUNT_EMAIL:
         required: true
+      # ── Runtime SA del servizio (opzionale) ─────────────────
       GCP_RUNTIME_SERVICE_ACCOUNT:
-        required: false   # email SA runtime del servizio (opzionale)
-
-env:
-  GO_VERSION: ${{ inputs.go_version }}
+        required: false
+      # ── Env vars Cloud Run (opzionali) ─────────────────────
+      GCP_PROJECT_ID:
+        required: false
+      FIREBASE_PROJECT_ID:
+        required: false
+      FIREBASE_WEB_API_KEY:
+        required: false
+      FIREBASE_STORAGE_BUCKET:
+        required: false
+      ADMIN_EMAILS:
+        required: false
+      GATEWAY_URL:
+        required: false
+      SERVICE_URL:
+        required: false
+      INTERNAL_SECRET:
+        required: false
+      DOCUMENT_SERVICE_URL:
+        required: false
 
 jobs:
   # ── 1. CI: vet + test ──────────────────────────────────────
@@ -65,10 +85,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Go ${{ env.GO_VERSION }}
+      - name: Set up Go ${{ inputs.go_version }}
         uses: actions/setup-go@v5
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version: ${{ inputs.go_version }}
           cache: true
 
       - name: go vet
@@ -84,7 +104,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write   # Workload Identity Federation
+      id-token: write
     concurrency:
       group: cloudrun-deploy-${{ inputs.service_name }}
       cancel-in-progress: true
@@ -99,15 +119,46 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
 
+      # Costruisce la stringa env_vars solo con i secrets non vuoti.
+      # deploy-cloudrun accetta KEY=value separati da virgola.
+      - name: Build env_vars string
+        id: envvars
+        shell: bash
+        env:
+          GCP_PROJECT_ID:        ${{ secrets.GCP_PROJECT_ID }}
+          FIREBASE_PROJECT_ID:   ${{ secrets.FIREBASE_PROJECT_ID }}
+          FIREBASE_WEB_API_KEY:  ${{ secrets.FIREBASE_WEB_API_KEY }}
+          FIREBASE_STORAGE_BUCKET: ${{ secrets.FIREBASE_STORAGE_BUCKET }}
+          ADMIN_EMAILS:          ${{ secrets.ADMIN_EMAILS }}
+          GATEWAY_URL:           ${{ secrets.GATEWAY_URL }}
+          SERVICE_URL:           ${{ secrets.SERVICE_URL }}
+          INTERNAL_SECRET:       ${{ secrets.INTERNAL_SECRET }}
+          DOCUMENT_SERVICE_URL:  ${{ secrets.DOCUMENT_SERVICE_URL }}
+        run: |
+          vars=()
+          [ -n "$GCP_PROJECT_ID" ]         && vars+=("ENV=production")
+          [ -n "$GCP_PROJECT_ID" ]         && vars+=("GOOGLE_CLOUD_PROJECT=$GCP_PROJECT_ID")
+          [ -n "$FIREBASE_PROJECT_ID" ]    && vars+=("FIREBASE_PROJECT_ID=$FIREBASE_PROJECT_ID")
+          [ -n "$FIREBASE_WEB_API_KEY" ]   && vars+=("FIREBASE_WEB_API_KEY=$FIREBASE_WEB_API_KEY")
+          [ -n "$FIREBASE_STORAGE_BUCKET" ] && vars+=("FIREBASE_STORAGE_BUCKET=$FIREBASE_STORAGE_BUCKET")
+          [ -n "$ADMIN_EMAILS" ]           && vars+=("ADMIN_EMAILS=$ADMIN_EMAILS")
+          [ -n "$GATEWAY_URL" ]            && vars+=("GATEWAY_URL=$GATEWAY_URL")
+          [ -n "$SERVICE_URL" ]            && vars+=("SERVICE_URL=$SERVICE_URL")
+          [ -n "$INTERNAL_SECRET" ]        && vars+=("INTERNAL_SECRET=$INTERNAL_SECRET")
+          [ -n "$DOCUMENT_SERVICE_URL" ]   && vars+=("DOCUMENT_SERVICE_URL=$DOCUMENT_SERVICE_URL")
+          # Unisce con virgola
+          result=$(IFS=','; echo "${vars[*]}")
+          echo "result=$result" >> $GITHUB_OUTPUT
+
       - name: Deploy to Cloud Run
         uses: google-github-actions/deploy-cloudrun@v2
         with:
           service: ${{ inputs.service_name }}
-          region: ${{ inputs.region }}
-          source: .
+          region:  ${{ inputs.region }}
+          source:  .
           flags: >
             --port=8080
             ${{ inputs.ingress_flag }}
             ${{ secrets.GCP_RUNTIME_SERVICE_ACCOUNT != '' && format('--service-account={0}', secrets.GCP_RUNTIME_SERVICE_ACCOUNT) || '' }}
             ${{ inputs.extra_flags }}
-          env_vars: ${{ inputs.env_vars }}
+          env_vars: ${{ steps.envvars.outputs.result }}
