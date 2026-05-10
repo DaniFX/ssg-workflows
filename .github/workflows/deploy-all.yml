@@ -1,0 +1,303 @@
+name: "[Orchestrator] Deploy All Services"
+
+# ──────────────────────────────────────────────────────────────
+# Orchestrator: triggera il deploy di tutti i microservizi SSG
+# in sequenza rispettando le dipendenze, poi verifica health.
+#
+# Flusso:
+#   1. ssg-nexus-document-service  (no deps)
+#   2. ssg-mail-reader-service     (no deps, parallelo a 1)
+#   3. ssg-finance-service         (dipende da document-service)
+#   4. ssg-gateway                 (dipende da tutti)
+#   5. ssg-nexus-portal-frontend   (frontend, dopo gateway)
+#
+# Trigger:
+#   - workflow_dispatch manuale (con input opzionale per deploy selettivo)
+#   - Può essere chiamato da altri workflow via repository_dispatch
+#
+# Secrets richiesti in ssg-workflows:
+#   GH_PAT  — Personal Access Token con scope: repo, workflow
+#             (necessario per triggerare workflow in altri repo)
+# ──────────────────────────────────────────────────────────────
+on:
+  workflow_dispatch:
+    inputs:
+      services:
+        description: |
+          Servizi da deployare (separati da virgola).
+          Lascia vuoto per deployare TUTTO.
+          Valori: document-service, mail-reader, finance-service, gateway, frontend
+        required: false
+        type: string
+        default: ""
+      skip_health_check:
+        description: "Salta i health check post-deploy"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  GCP_PROJECT:  ssg-api-99ac0
+  GCP_REGION:   europe-west8
+  GH_ORG:       DaniFX
+
+jobs:
+  # ──────────────────────────────────────────────────────────────
+  # TIER 1 — Nessuna dipendenza (paralleli)
+  # ──────────────────────────────────────────────────────────────
+  deploy-document-service:
+    name: "1️⃣ Deploy document-service"
+    runs-on: ubuntu-latest
+    if: ${{ inputs.services == '' || contains(inputs.services, 'document-service') }}
+    steps:
+      - name: Trigger deploy
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          gh workflow run deploy.yml \
+            --repo ${{ env.GH_ORG }}/ssg-nexus-document-service \
+            --ref main
+
+      - name: Wait for completion
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          echo "Attendo avvio workflow..."
+          sleep 10
+          # Prende l'ID del run più recente
+          RUN_ID=$(gh run list \
+            --repo ${{ env.GH_ORG }}/ssg-nexus-document-service \
+            --workflow=deploy.yml \
+            --limit=1 \
+            --json databaseId \
+            --jq '.[0].databaseId')
+          echo "Run ID: $RUN_ID"
+          gh run watch $RUN_ID \
+            --repo ${{ env.GH_ORG }}/ssg-nexus-document-service \
+            --exit-status
+
+  deploy-mail-reader:
+    name: "1️⃣ Deploy mail-reader-service"
+    runs-on: ubuntu-latest
+    if: ${{ inputs.services == '' || contains(inputs.services, 'mail-reader') }}
+    steps:
+      - name: Trigger deploy
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          gh workflow run deploy.yml \
+            --repo ${{ env.GH_ORG }}/ssg-mail-reader-service \
+            --ref main
+
+      - name: Wait for completion
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          echo "Attendo avvio workflow..."
+          sleep 10
+          RUN_ID=$(gh run list \
+            --repo ${{ env.GH_ORG }}/ssg-mail-reader-service \
+            --workflow=deploy.yml \
+            --limit=1 \
+            --json databaseId \
+            --jq '.[0].databaseId')
+          echo "Run ID: $RUN_ID"
+          gh run watch $RUN_ID \
+            --repo ${{ env.GH_ORG }}/ssg-mail-reader-service \
+            --exit-status
+
+  # ──────────────────────────────────────────────────────────────
+  # TIER 2 — Dipende da document-service
+  # ──────────────────────────────────────────────────────────────
+  deploy-finance-service:
+    name: "2️⃣ Deploy finance-service"
+    runs-on: ubuntu-latest
+    needs: [deploy-document-service]
+    if: |
+      always() &&
+      (needs.deploy-document-service.result == 'success' || needs.deploy-document-service.result == 'skipped') &&
+      (inputs.services == '' || contains(inputs.services, 'finance-service'))
+    steps:
+      - name: Trigger deploy
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          gh workflow run deploy.yml \
+            --repo ${{ env.GH_ORG }}/ssg-finance-service \
+            --ref main
+
+      - name: Wait for completion
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          sleep 10
+          RUN_ID=$(gh run list \
+            --repo ${{ env.GH_ORG }}/ssg-finance-service \
+            --workflow=deploy.yml \
+            --limit=1 \
+            --json databaseId \
+            --jq '.[0].databaseId')
+          echo "Run ID: $RUN_ID"
+          gh run watch $RUN_ID \
+            --repo ${{ env.GH_ORG }}/ssg-finance-service \
+            --exit-status
+
+  # ──────────────────────────────────────────────────────────────
+  # TIER 3 — Gateway (dipende da tutti)
+  # ──────────────────────────────────────────────────────────────
+  deploy-gateway:
+    name: "3️⃣ Deploy gateway"
+    runs-on: ubuntu-latest
+    needs: [deploy-finance-service, deploy-mail-reader]
+    if: |
+      always() &&
+      (needs.deploy-finance-service.result == 'success' || needs.deploy-finance-service.result == 'skipped') &&
+      (needs.deploy-mail-reader.result == 'success' || needs.deploy-mail-reader.result == 'skipped') &&
+      (inputs.services == '' || contains(inputs.services, 'gateway'))
+    steps:
+      - name: Trigger deploy
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          gh workflow run deploy.yml \
+            --repo ${{ env.GH_ORG }}/ssg-gateway \
+            --ref main
+
+      - name: Wait for completion
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          sleep 10
+          RUN_ID=$(gh run list \
+            --repo ${{ env.GH_ORG }}/ssg-gateway \
+            --workflow=deploy.yml \
+            --limit=1 \
+            --json databaseId \
+            --jq '.[0].databaseId')
+          echo "Run ID: $RUN_ID"
+          gh run watch $RUN_ID \
+            --repo ${{ env.GH_ORG }}/ssg-gateway \
+            --exit-status
+
+  # ──────────────────────────────────────────────────────────────
+  # TIER 4 — Health check Cloud Run
+  # ──────────────────────────────────────────────────────────────
+  health-check-services:
+    name: "✅ Health check servizi Cloud Run"
+    runs-on: ubuntu-latest
+    needs: [deploy-gateway]
+    if: |
+      always() &&
+      needs.deploy-gateway.result != 'failure' &&
+      inputs.skip_health_check != true
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Check Cloud Run services
+        run: |
+          SERVICES=("ssg-document-service" "ssg-mail-reader-service" "ssg-finance-service" "ssg-gateway")
+          FAILED=()
+
+          for SVC in "${SERVICES[@]}"; do
+            echo ""
+            echo "🔍 Checking $SVC..."
+            STATUS=$(gcloud run services describe "$SVC" \
+              --region=${{ env.GCP_REGION }} \
+              --project=${{ env.GCP_PROJECT }} \
+              --format="value(status.conditions[0].status)" 2>/dev/null || echo "NOT_FOUND")
+
+            REVISION=$(gcloud run services describe "$SVC" \
+              --region=${{ env.GCP_REGION }} \
+              --project=${{ env.GCP_PROJECT }} \
+              --format="value(status.latestReadyRevisionName)" 2>/dev/null || echo "unknown")
+
+            if [ "$STATUS" = "True" ]; then
+              echo "✅ $SVC — OK (revision: $REVISION)"
+            else
+              echo "❌ $SVC — UNHEALTHY (status: $STATUS, revision: $REVISION)"
+              FAILED+=("$SVC")
+            fi
+          done
+
+          if [ ${#FAILED[@]} -gt 0 ]; then
+            echo ""
+            echo "🚨 Servizi in errore: ${FAILED[*]}"
+            exit 1
+          fi
+
+          echo ""
+          echo "🎉 Tutti i servizi Cloud Run sono healthy!"
+
+  # ──────────────────────────────────────────────────────────────
+  # TIER 5 — Frontend (dopo gateway healthy)
+  # ──────────────────────────────────────────────────────────────
+  deploy-frontend:
+    name: "4️⃣ Deploy frontend"
+    runs-on: ubuntu-latest
+    needs: [health-check-services]
+    if: |
+      always() &&
+      (needs.health-check-services.result == 'success' || needs.health-check-services.result == 'skipped') &&
+      (inputs.services == '' || contains(inputs.services, 'frontend'))
+    steps:
+      - name: Trigger deploy
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          gh workflow run deploy-firebase.yml \
+            --repo ${{ env.GH_ORG }}/ssg-nexus-portal-frontend \
+            --ref main
+
+      - name: Wait for completion
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          sleep 10
+          RUN_ID=$(gh run list \
+            --repo ${{ env.GH_ORG }}/ssg-nexus-portal-frontend \
+            --workflow=deploy-firebase.yml \
+            --limit=1 \
+            --json databaseId \
+            --jq '.[0].databaseId')
+          echo "Run ID: $RUN_ID"
+          gh run watch $RUN_ID \
+            --repo ${{ env.GH_ORG }}/ssg-nexus-portal-frontend \
+            --exit-status
+
+  # ──────────────────────────────────────────────────────────────
+  # SUMMARY — Riepilogo finale
+  # ──────────────────────────────────────────────────────────────
+  summary:
+    name: "📊 Deploy Summary"
+    runs-on: ubuntu-latest
+    needs:
+      - deploy-document-service
+      - deploy-mail-reader
+      - deploy-finance-service
+      - deploy-gateway
+      - health-check-services
+      - deploy-frontend
+    if: always()
+    steps:
+      - name: Print summary
+        run: |
+          echo "## 🚀 SSG Deploy Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Servizio | Risultato |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-----------|" >> $GITHUB_STEP_SUMMARY
+          echo "| ssg-nexus-document-service | ${{ needs.deploy-document-service.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| ssg-mail-reader-service    | ${{ needs.deploy-mail-reader.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| ssg-finance-service        | ${{ needs.deploy-finance-service.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| ssg-gateway                | ${{ needs.deploy-gateway.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| health-check-services      | ${{ needs.health-check-services.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| ssg-nexus-portal-frontend  | ${{ needs.deploy-frontend.result }} |" >> $GITHUB_STEP_SUMMARY
