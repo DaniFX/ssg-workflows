@@ -1,0 +1,82 @@
+name: "[Reusable] Firebase Hosting — Live Deploy"
+
+# ──────────────────────────────────────────────────────────────
+# Reusable workflow: build Vite → deploy LIVE to Firebase Hosting
+# Chiamato al push su main da ogni frontend project.
+# ──────────────────────────────────────────────────────────────
+on:
+  workflow_call:
+    inputs:
+      node_version:
+        description: "Node.js version"
+        required: false
+        type: string
+        default: "20"
+      build_command:
+        description: "Build command"
+        required: false
+        type: string
+        default: "npm run build"
+      # Nomi dei secrets Vite passati dal repo chiamante via `secrets: inherit`
+      # I valori vengono iniettati come env durante la build.
+      # Il repo chiamante deve avere i secrets con questi nomi esatti.
+    secrets:
+      FIREBASE_SERVICE_ACCOUNT:
+        required: true
+      VITE_FIREBASE_API_KEY:
+        required: false
+      VITE_FIREBASE_AUTH_DOMAIN:
+        required: false
+      VITE_FIREBASE_PROJECT_ID:
+        required: true
+      VITE_FIREBASE_STORAGE_BUCKET:
+        required: false
+      VITE_FIREBASE_MESSAGING_SENDER_ID:
+        required: false
+      VITE_FIREBASE_APP_ID:
+        required: false
+      VITE_BFF_URL:
+        required: false
+
+jobs:
+  deploy:
+    name: Build & Deploy Live
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: firebase-live-deploy-${{ github.repository }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node ${{ inputs.node_version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: ${{ inputs.build_command }}
+        env:
+          VITE_FIREBASE_API_KEY:              ${{ secrets.VITE_FIREBASE_API_KEY }}
+          VITE_FIREBASE_AUTH_DOMAIN:          ${{ secrets.VITE_FIREBASE_AUTH_DOMAIN }}
+          VITE_FIREBASE_PROJECT_ID:           ${{ secrets.VITE_FIREBASE_PROJECT_ID }}
+          VITE_FIREBASE_STORAGE_BUCKET:       ${{ secrets.VITE_FIREBASE_STORAGE_BUCKET }}
+          VITE_FIREBASE_MESSAGING_SENDER_ID:  ${{ secrets.VITE_FIREBASE_MESSAGING_SENDER_ID }}
+          VITE_FIREBASE_APP_ID:               ${{ secrets.VITE_FIREBASE_APP_ID }}
+          VITE_BFF_URL:                       ${{ secrets.VITE_BFF_URL }}
+
+      - name: Deploy to Firebase Hosting (live)
+        uses: FirebaseExtended/action-hosting-deploy@v0
+        with:
+          repoToken:              ${{ secrets.GITHUB_TOKEN }}
+          firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          projectId:              ${{ secrets.VITE_FIREBASE_PROJECT_ID }}
+          channelId:              live

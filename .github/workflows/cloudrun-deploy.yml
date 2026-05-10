@@ -1,0 +1,108 @@
+name: "[Reusable] Go CI + Cloud Run Deploy"
+
+# ──────────────────────────────────────────────────────────────
+# Reusable workflow: Go vet/test → deploy to GCP Cloud Run
+# Called by each Go microservice with its own service_name
+# and env_vars.
+# ──────────────────────────────────────────────────────────────
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        description: "Cloud Run service name (e.g. ssg-gateway)"
+        required: true
+        type: string
+      go_version:
+        description: "Go version to use"
+        required: false
+        type: string
+        default: "1.22"
+      region:
+        description: "GCP region"
+        required: false
+        type: string
+        default: "europe-west8"
+      ingress_flag:
+        description: "--ingress flag value (e.g. --ingress=internal-and-cloud-load-balancing)"
+        required: false
+        type: string
+        default: "--ingress=internal-and-cloud-load-balancing"
+      service_account_flag:
+        description: "--service-account flag (e.g. --service-account=sa@project.iam.gserviceaccount.com)"
+        required: false
+        type: string
+        default: ""
+      extra_flags:
+        description: "Additional Cloud Run flags"
+        required: false
+        type: string
+        default: ""
+      env_vars:
+        description: "Newline-separated env vars for Cloud Run (KEY=value)"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      GCP_WORKLOAD_IDENTITY_PROVIDER:
+        required: true
+      GCP_SERVICE_ACCOUNT_EMAIL:
+        required: true
+
+env:
+  GO_VERSION: ${{ inputs.go_version }}
+
+jobs:
+  # ── 1. CI: vet + test ──────────────────────────────────────
+  ci:
+    name: Go CI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./... -race -timeout 120s
+
+  # ── 2. Deploy (solo se CI verde) ───────────────────────────
+  deploy:
+    name: Deploy → Cloud Run (${{ inputs.service_name }})
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # Workload Identity Federation
+    concurrency:
+      group: cloudrun-deploy-${{ inputs.service_name }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Deploy to Cloud Run
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: ${{ inputs.service_name }}
+          region: ${{ inputs.region }}
+          source: .
+          flags: |
+            --port=8080
+            ${{ inputs.ingress_flag }}
+            ${{ inputs.service_account_flag }}
+            ${{ inputs.extra_flags }}
+          env_vars: ${{ inputs.env_vars }}
